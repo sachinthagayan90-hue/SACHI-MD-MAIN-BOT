@@ -1,0 +1,7 @@
+SACHi-MD Quick Tunnel V3
+1. Keep the existing /home/container/session folder. Do not delete it.
+2. Keep Startup JS FILE = start.js.
+3. Keep Startup Command = node /home/container/start.js.
+4. Start the server.
+5. Wait for: [QUICK TUNNEL URL] https://....trycloudflare.com
+The V3 start.js intentionally does not use --logfile so cloudflared's issued Quick Tunnel URL is captured directly from stdout/stderr.

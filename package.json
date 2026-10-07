@@ -1,0 +1,25 @@
+{
+  "name": "sachi-md-bot",
+  "version": "2.3.2",
+  "description": "SACHi-MD WhatsApp bot with stylish image menu, button navigation, alive voice, owner panel and media tools",
+  "main": "start.js",
+  "scripts": {
+    "start": "node start.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@hapi/boom": "10.0.1",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "axios": "1.12.2",
+    "duck-duck-scrape": "2.2.7",
+    "pino": "9.13.0",
+    "facebook-dl": "1.0.0",
+    "yt-search": "2.13.1",
+    "qrcode-terminal": "0.12.0",
+    "youtubei.js": "18.1.0",
+    "long": "5.3.2"
+  },
+  "type": "module"
+}

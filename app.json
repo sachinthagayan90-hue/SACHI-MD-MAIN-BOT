@@ -1,0 +1,5 @@
+{
+  "name": "SACHi-MD",
+  "description": "SACHi-MD WhatsApp bot",
+  "main": "start.js"
+}

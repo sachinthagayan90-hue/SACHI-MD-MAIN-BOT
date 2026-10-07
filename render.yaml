@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sachi-md
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node start.js
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
