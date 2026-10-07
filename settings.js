@@ -2,7 +2,7 @@ export default {
   BOT_NAME: "SACHi-MD",
   OWNER_NAME: "Sachintha",
   OWNER_NUMBER: "94778936490",
-  PAIRING_NUMBER: "94778936490",
+  PAIRING_NUMBER: "94713095004",
   PREFIX: ".",
   SESSION_DIR: "./session",
   MAX_MEDIA_MB: 15,
