@@ -32,6 +32,7 @@ const phone = String(settings.PAIRING_NUMBER || "").replace(/\D/g, "");
 let reconnectTimer = null;
 let pairingReady = false;
 let latestPairingCode = '';
+const apiCtx = { sock: null, state: null, requestPairing: null };
 let pairingServerStarted = false;
 let ownerWelcomed = false;
 const processedMessages = new Set();
@@ -816,6 +817,8 @@ async function connect() {
     const apiKey = String(process.env.WEB_API_KEY || "");
 
     const server = http.createServer(async (req, res) => {
+      // Always use the CURRENT socket (the old one is dead after a reconnect).
+      const sock = apiCtx.sock, state = apiCtx.state, requestPairing = apiCtx.requestPairing;
       const origin = req.headers.origin || "*";
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
@@ -930,6 +933,7 @@ async function connect() {
     server.listen(port, "0.0.0.0", () => console.log(`[SACHi-MD] Pairing API listening on port ${port}`));
   }
 
+  apiCtx.sock = sock; apiCtx.state = state; apiCtx.requestPairing = requestPairing;
   startPairingApi();
 
   sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
@@ -1005,6 +1009,7 @@ async function connect() {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
       console.log(`[SACHi-MD] Connection closed: ${statusCode || "unknown"}`);
+      pairingReady = false;
 
       if (loggedOut) {
         console.log("[SACHi-MD] Logged out. Delete session/ and pair again.");
