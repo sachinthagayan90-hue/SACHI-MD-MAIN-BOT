@@ -54,13 +54,10 @@ let inboxBadWords = [];
 const ECONOMY_FILE = path.join(__dirname, "economy.json");
 const PREMIUM_FILE = path.join(__dirname, "premium_users.json");
 const STATS_FILE = path.join(__dirname, "bot_stats.json");
-const BLOCKED_USERS_FILE = path.join(__dirname, "blocked_users.json");
-const COMMAND_LOG_FILE = path.join(__dirname, "command_history.json");
-let blockedUsers = loadJsonFile(BLOCKED_USERS_FILE, {});
-let commandHistory = loadJsonFile(COMMAND_LOG_FILE, []);
 let economy = {};
 let premiumUsers = {};
 let botStats = { messages: 0, commands: 0, groups: {}, users: {}, startedAt: Date.now() };
+const recentCommands = [];
 const floodTracker = new Map();
 const PROFILE_FILE = path.join(__dirname, "profiles.json");
 const MUSIC_QUEUE_FILE = path.join(__dirname, "music_queues.json");
@@ -812,28 +809,12 @@ async function connect() {
     }
   }
 
-  function saveCommandLog(entry) {
-    commandHistory.unshift({ ...entry, time: new Date().toISOString() });
-    commandHistory = commandHistory.slice(0, 500);
-    saveJsonFile(COMMAND_LOG_FILE, commandHistory);
-  }
-  function adminKeyOk(req) {
-    const apiKey = String(process.env.WEB_API_KEY || "");
-    return !apiKey || String(req.headers["x-api-key"] || "") === apiKey;
-  }
-  function json(res, status, data) { res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify(data)); }
-  async function readBody(req) {
-    return await new Promise((resolve, reject) => { let d=""; req.on("data", c => { d += c; if (d.length > 1e6) req.destroy(); }); req.on("end", () => { try { resolve(d ? JSON.parse(d) : {}); } catch { resolve({}); } }); req.on("error", reject); });
-  }
-  function runtimeConfig() {
-    const r = loadJsonFile(RUNTIME_SETTINGS_FILE, {});
-    return { ...r, PREFIX: r.PREFIX ?? settings.PREFIX, AUTO_REPLY: r.AUTO_REPLY ?? settings.AUTO_REPLY, AUTO_REACT: r.AUTO_REACT ?? settings.AUTO_REACT, AUTO_READ: r.AUTO_READ ?? settings.AUTO_READ, AUTO_STATUS: r.AUTO_STATUS ?? settings.AUTO_STATUS, ANTI_DELETE: r.ANTI_DELETE ?? settings.ANTI_DELETE, EDIT_NOTIFY: r.EDIT_NOTIFY ?? settings.EDIT_NOTIFY, VIEW_ONCE_NOTIFY: r.VIEW_ONCE_NOTIFY ?? settings.VIEW_ONCE_NOTIFY, VIEW_ONCE_AUTO_INBOX: r.VIEW_ONCE_AUTO_INBOX ?? settings.VIEW_ONCE_AUTO_INBOX, INBOX_ANTI_BADWORD: r.INBOX_ANTI_BADWORD ?? settings.INBOX_ANTI_BADWORD, PUBLIC_MODE: r.PUBLIC_MODE ?? settings.PUBLIC_MODE, AI_ENABLED: r.AI_ENABLED ?? settings.AI_ENABLED };
-  }
-
   function startPairingApi() {
     if (pairingServerStarted) return;
     pairingServerStarted = true;
-    const port = Number(process.env.PORT || 20064);
+    const port = Number(process.env.PORT || 3000);
+    const apiKey = String(process.env.WEB_API_KEY || "");
+
     const server = http.createServer(async (req, res) => {
       const origin = req.headers.origin || "*";
       res.setHeader("Access-Control-Allow-Origin", origin);
@@ -841,25 +822,112 @@ async function connect() {
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
       if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
       const u = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-      if (u.pathname === "/" || u.pathname === "/index.html") {
-        try { const html=fs.readFileSync(path.join(__dirname,"index.html"),"utf8"); res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"}); return res.end(html); } catch { return json(res,500,{ok:false,error:"WEB_UNAVAILABLE"}); }
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+
+      if (u.pathname === "/api/health") {
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true, connected: !!sock.user?.id, pairingReady, uptimeSeconds: Math.floor(process.uptime()) }));
       }
-      if (u.pathname === "/api/health") return json(res,200,{ok:true,connected:!!sock.user?.id,pairingReady,uptime:formatDuration(Date.now()-Number(botStats.startedAt||Date.now())),uptimeSeconds:Math.floor((Date.now()-Number(botStats.startedAt||Date.now()))/1000),version:"V8"});
-      if (!adminKeyOk(req)) return json(res,401,{ok:false,error:"INVALID_API_KEY"});
-      if (u.pathname === "/api/pair" && req.method === "GET") {
-        const requested=String(u.searchParams.get("phone")||"").replace(/\D/g,"");
-        if (!requested || requested!==phone) return json(res,400,{ok:false,error:"PHONE_NOT_ALLOWED"});
-        if (state.creds.registered) return json(res,409,{ok:false,error:"ALREADY_CONNECTED"});
-        try { if(!pairingReady){const started=Date.now();while(!pairingReady&&Date.now()-started<30000) await new Promise(r=>setTimeout(r,500));} const code=await requestPairing(); return json(res,200,{ok:true,phone:requested,code}); } catch(e){return json(res,500,{ok:false,error:e?.message||"PAIRING_FAILED"});}
+      if (u.pathname.startsWith("/api/admin/")) {
+        const send = (code, obj) => { res.writeHead(code); return res.end(JSON.stringify(obj)); };
+        if (!apiKey) return send(403, { ok: false, error: "ADMIN_DISABLED", message: "Set WEB_API_KEY on the bot server to enable the owner panel." });
+        if (String(req.headers["x-api-key"] || "") !== apiKey) return send(401, { ok: false, error: "INVALID_API_KEY" });
+        const readBody = () => new Promise((resolve) => {
+          let raw = "";
+          req.on("data", (c) => { raw += c; if (raw.length > 10000) req.destroy(); });
+          req.on("end", () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); } });
+          req.on("error", () => resolve({}));
+        });
+        try {
+          if (u.pathname === "/api/admin/state" && req.method === "GET") {
+            let blocked = [];
+            try { blocked = ((await sock.fetchBlocklist()) || []).map((j) => String(j).split("@")[0]); } catch {}
+            const users = Object.entries(botStats.users || {}).sort((x, y) => y[1] - x[1]).slice(0, 100)
+              .map(([jid, count]) => ({ jid, count, premium: isPremium(jid) }));
+            return send(200, {
+              ok: true,
+              connected: !!sock.user?.id,
+              settings: {
+                AUTO_REPLY: !!settings.AUTO_REPLY_DAILY, AUTO_REACT: !!settings.AUTO_REACT, AUTO_READ: !!settings.AUTO_READ,
+                AUTO_STATUS: !!settings.AUTO_STATUS, ANTI_DELETE: !!settings.ANTI_DELETE, EDIT_NOTIFY: !!settings.EDIT_NOTIFY,
+                VIEW_ONCE_AUTO_INBOX: !!settings.VIEW_ONCE_AUTO_INBOX, INBOX_ANTI_BADWORD: !!settings.INBOX_ANTI_BADWORD,
+                PREFIX: settings.PREFIX
+              },
+              stats: { startedAt: Number(botStats.startedAt || Date.now()), messages: botStats.messages, commands: botStats.commands },
+              users, blocked, commands: recentCommands
+            });
+          }
+          if (req.method !== "POST") return send(405, { ok: false, error: "METHOD_NOT_ALLOWED" });
+          const body = await readBody();
+          if (u.pathname === "/api/admin/settings") {
+            const bools = { AUTO_REPLY: "AUTO_REPLY_DAILY", AUTO_REACT: "AUTO_REACT", AUTO_READ: "AUTO_READ", AUTO_STATUS: "AUTO_STATUS",
+              ANTI_DELETE: "ANTI_DELETE", EDIT_NOTIFY: "EDIT_NOTIFY", VIEW_ONCE_AUTO_INBOX: "VIEW_ONCE_AUTO_INBOX", INBOX_ANTI_BADWORD: "INBOX_ANTI_BADWORD" };
+            for (const [k, target] of Object.entries(bools)) if (typeof body[k] === "boolean") settings[target] = body[k];
+            if (typeof body.PREFIX === "string") {
+              const p = body.PREFIX.trim();
+              if (!p || p.length > 3) return send(400, { ok: false, error: "INVALID_PREFIX", message: "Prefix must be 1-3 characters." });
+              settings.PREFIX = p;
+            }
+            saveRuntimeSettings();
+            return send(200, { ok: true, message: "Settings saved." });
+          }
+          if (u.pathname === "/api/admin/block" || u.pathname === "/api/admin/unblock") {
+            const n = String(body.number || "").replace(/\D/g, "");
+            if (n.length < 8) return send(400, { ok: false, error: "INVALID_NUMBER", message: "Enter a number with country code." });
+            await sock.updateBlockStatus(`${n}@s.whatsapp.net`, u.pathname.endsWith("/block") ? "block" : "unblock");
+            return send(200, { ok: true, message: `+${n} ${u.pathname.endsWith("/block") ? "blocked" : "unblocked"}.` });
+          }
+          if (u.pathname === "/api/admin/action") {
+            if (body.action === "restart") {
+              setTimeout(() => process.exit(0), 1000);
+              return send(200, { ok: true, message: "Restarting… the host will start the bot again." });
+            }
+            if (body.action === "stop") {
+              await sock.logout();
+              return send(200, { ok: true, message: "Logged out. Pair again from the Pairing section." });
+            }
+            return send(400, { ok: false, error: "UNKNOWN_ACTION" });
+          }
+          return send(404, { ok: false, error: "NOT_FOUND" });
+        } catch (e) {
+          return send(500, { ok: false, error: "ADMIN_FAILED", message: e?.message || "Request failed" });
+        }
       }
-      if (u.pathname === "/api/admin/state" && req.method === "GET") return json(res,200,{ok:true,connected:!!sock.user?.id,settings:runtimeConfig(),stats:botStats,users:Object.entries(botStats.users||{}).map(([jid,count])=>({jid,count,premium:isPremium(jid)})),blocked:Object.keys(blockedUsers),commands:commandHistory.slice(0,100)});
-      if (u.pathname === "/api/admin/settings" && req.method === "POST") { const b=await readBody(req); const current=loadJsonFile(RUNTIME_SETTINGS_FILE,{}); const allowed=["PREFIX","AUTO_REPLY","AUTO_REACT","AUTO_READ","AUTO_STATUS","ANTI_DELETE","EDIT_NOTIFY","VIEW_ONCE_NOTIFY","VIEW_ONCE_AUTO_INBOX","INBOX_ANTI_BADWORD","PUBLIC_MODE","AI_ENABLED","BOT_NAME","OWNER_NAME","FOOTER","MEDIA_LIMIT"]; for(const k of allowed) if(k in b) current[k]=b[k]; saveJsonFile(RUNTIME_SETTINGS_FILE,current); return json(res,200,{ok:true,settings:runtimeConfig()}); }
-      if (u.pathname === "/api/admin/block" && req.method === "POST") { const b=await readBody(req); const n=String(b.number||"").replace(/\D/g,""); if(!n) return json(res,400,{ok:false,error:"NUMBER_REQUIRED"}); if(n===phone) return json(res,400,{ok:false,error:"OWNER_CANNOT_BE_BLOCKED"}); blockedUsers[n]={blockedAt:Date.now()}; saveJsonFile(BLOCKED_USERS_FILE,blockedUsers); return json(res,200,{ok:true,blocked:Object.keys(blockedUsers)}); }
-      if (u.pathname === "/api/admin/unblock" && req.method === "POST") { const b=await readBody(req); const n=String(b.number||"").replace(/\D/g,""); delete blockedUsers[n]; saveJsonFile(BLOCKED_USERS_FILE,blockedUsers); return json(res,200,{ok:true,blocked:Object.keys(blockedUsers)}); }
-      if (u.pathname === "/api/admin/action" && req.method === "POST") { const b=await readBody(req); const a=String(b.action||""); if(a==="restart"){json(res,200,{ok:true,message:"Restarting"}); setTimeout(()=>process.exit(0),300); return;} if(a==="stop"){json(res,200,{ok:true,message:"Stopping"}); try{await sock.logout();}catch{} return;} if(a==="start"){return json(res,200,{ok:true,message:"Bot process already running"});} return json(res,400,{ok:false,error:"UNKNOWN_ACTION"}); }
-      return json(res,404,{ok:false,error:"NOT_FOUND"});
+      if (u.pathname !== "/api/pair" || req.method !== "GET") {
+        res.writeHead(404);
+        return res.end(JSON.stringify({ ok: false, error: "NOT_FOUND" }));
+      }
+      if (apiKey && String(req.headers["x-api-key"] || "") !== apiKey) {
+        res.writeHead(401);
+        return res.end(JSON.stringify({ ok: false, error: "INVALID_API_KEY" }));
+      }
+      const requested = String(u.searchParams.get("phone") || "").replace(/\D/g, "");
+      if (!requested || requested !== phone) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ ok: false, error: "PHONE_NOT_ALLOWED", message: "Use the pairing number configured on the bot server." }));
+      }
+      if (state.creds.registered) {
+        res.writeHead(409);
+        return res.end(JSON.stringify({ ok: false, error: "ALREADY_CONNECTED" }));
+      }
+      try {
+        if (!pairingReady) {
+          const started = Date.now();
+          while (!pairingReady && Date.now() - started < 30000) {
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+        if (!pairingReady) throw new Error("PAIRING_NOT_READY");
+        const code = await requestPairing();
+        if (!code) throw new Error("PAIRING_CODE_UNAVAILABLE");
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true, phone: requested, code }));
+      } catch (e) {
+        res.writeHead(500);
+        return res.end(JSON.stringify({ ok: false, error: e?.message || "PAIRING_FAILED" }));
+      }
     });
-    server.listen(port,"0.0.0.0",()=>console.log(`[SACHi-MD] Admin/Pairing API listening on port ${port}`));
+    server.listen(port, "0.0.0.0", () => console.log(`[SACHi-MD] Pairing API listening on port ${port}`));
   }
 
   startPairingApi();
@@ -1044,9 +1112,8 @@ async function connect() {
 
     for (const msg of messages) {
       if (!msg.message) continue;
+
       const chat = msg.key.remoteJid;
-      const blockedNumber = String(msg.key.participant || chat || "").split("@")[0].split(":")[0];
-      if (!msg.key.fromMe && blockedUsers[blockedNumber]) continue;
       const buttonId = buttonIdOf(msg.message);
       const body = textOf(msg.message) || buttonId;
 
@@ -1086,7 +1153,7 @@ async function connect() {
       }
 
       console.log(`[MESSAGE] type=${type} fromMe=${!!msg.key.fromMe} jid=${chat} body=${JSON.stringify(body)}`);
-      if (!msg.key.fromMe && body) { botStats.messages = Number(botStats.messages||0)+1; const u=String(msg.key.participant||chat||""); botStats.users[u]=(botStats.users[u]||0)+1; if (chat?.endsWith("@g.us")) botStats.groups[chat]=(botStats.groups[chat]||0)+1; if (body.startsWith(String(settings.PREFIX))) botStats.commands=Number(botStats.commands||0)+1; if (body.startsWith(String(settings.PREFIX))) saveCommandLog({ jid:u, command:body.trim().split(/\s+/)[0], chat }); if (botStats.messages % 20 === 0) saveJsonFile(STATS_FILE, botStats); }
+      if (!msg.key.fromMe && body) { botStats.messages = Number(botStats.messages||0)+1; const u=String(msg.key.participant||chat||""); botStats.users[u]=(botStats.users[u]||0)+1; if (chat?.endsWith("@g.us")) botStats.groups[chat]=(botStats.groups[chat]||0)+1; if (body.startsWith(String(settings.PREFIX))) botStats.commands=Number(botStats.commands||0)+1; if (body.startsWith(String(settings.PREFIX))) { recentCommands.unshift({ command: body.slice(String(settings.PREFIX).length).trim().split(/\s+/)[0] || "", jid: String(msg.key.participant||chat||""), time: new Date().toLocaleString("en-LK") }); if (recentCommands.length > 100) recentCommands.length = 100; } if (botStats.messages % 20 === 0) saveJsonFile(STATS_FILE, botStats); }
 
       // Daily first-message auto reply for private incoming chats.
       // Groups, broadcasts, status updates, and the bot owner's own messages
